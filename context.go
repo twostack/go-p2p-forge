@@ -40,6 +40,9 @@ type StreamContext struct {
 	// PoolBuf tracks a pooled buffer for lifecycle management.
 	PoolBuf *codec.PoolBuffer
 
+	// Registry provides access to server-level singletons registered via Server.Provide().
+	Registry *Registry
+
 	// values is a bag for inter-middleware communication.
 	values map[any]any
 }

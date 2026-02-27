@@ -27,8 +27,11 @@ type Server struct {
 	host       host.Host
 	node       *node.Node
 	lifecycle  *service.Lifecycle
-	handlers   map[protocol.ID]network.StreamHandler
-	transports []libp2p.Option
+	handlers       map[protocol.ID]network.StreamHandler
+	transports     []libp2p.Option
+	registry       *Registry
+	onConnected    []func(peer.ID)
+	onDisconnected []func(peer.ID)
 }
 
 // Option configures a Server.
@@ -41,6 +44,7 @@ func NewServer(opts ...Option) *Server {
 		config:   DefaultConfig(),
 		logger:   slog.Default(),
 		handlers: make(map[protocol.ID]network.StreamHandler),
+		registry: NewRegistry(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -89,6 +93,18 @@ func WithPreset(preset Preset) Option {
 	return func(s *Server) { preset(s.config) }
 }
 
+// OnPeerConnected registers a callback invoked when a new peer connection is established.
+// Multiple callbacks can be registered; they execute in registration order.
+func OnPeerConnected(fn func(peer.ID)) Option {
+	return func(s *Server) { s.onConnected = append(s.onConnected, fn) }
+}
+
+// OnPeerDisconnected registers a callback invoked when a peer disconnects.
+// Multiple callbacks can be registered; they execute in registration order.
+func OnPeerDisconnected(fn func(peer.ID)) Option {
+	return func(s *Server) { s.onDisconnected = append(s.onDisconnected, fn) }
+}
+
 // Handle registers a protocol handler.
 func (s *Server) Handle(id protocol.ID, handler network.StreamHandler) {
 	s.handlers[id] = handler
@@ -97,6 +113,17 @@ func (s *Server) Handle(id protocol.ID, handler network.StreamHandler) {
 // AddService registers a background service that participates in the lifecycle.
 func (s *Server) AddService(svc service.Service) {
 	s.lifecycle.Register(svc)
+}
+
+// Provide registers a server-level singleton accessible to all pipeline handlers
+// via ServiceFrom[T]. Must be called before Start(). Panics on duplicate keys.
+func (s *Server) Provide(key string, value any) {
+	s.registry.Provide(key, value)
+}
+
+// Registry returns the server's service registry for use with Pipeline.WithRegistry().
+func (s *Server) Registry() *Registry {
+	return s.registry
 }
 
 // Host returns the underlying libp2p host (available after Start).
@@ -111,6 +138,32 @@ func (s *Server) PeerID() peer.ID {
 		return ""
 	}
 	return s.host.ID()
+}
+
+// OpenStream opens a new stream to the given peer for the specified protocol
+// and returns a StreamContext ready for writing. The caller is responsible for
+// closing the stream when done.
+//
+// This enables server-initiated communication (e.g., push notifications).
+// Use codec.WriteFrame() and codec.ReadFrame() on sc.Stream for I/O.
+func (s *Server) OpenStream(ctx context.Context, peerID peer.ID, proto protocol.ID) (*StreamContext, error) {
+	if s.host == nil {
+		return nil, ErrServerNotStarted
+	}
+
+	stream, err := s.host.NewStream(ctx, peerID, proto)
+	if err != nil {
+		return nil, fmt.Errorf("open stream to %s: %w", peerID, err)
+	}
+
+	sc := &StreamContext{
+		Ctx:    ctx,
+		Stream: stream,
+		PeerID: peerID,
+		Logger: s.logger.With("peer", peerID.String(), "protocol", string(proto), "direction", "outbound"),
+	}
+
+	return sc, nil
 }
 
 // Start initializes the P2P stack, registers handlers, and starts services.
@@ -142,6 +195,24 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.host = h
 
+	// Register connection event hooks.
+	if len(s.onConnected) > 0 || len(s.onDisconnected) > 0 {
+		s.host.Network().Notify(&network.NotifyBundle{
+			ConnectedF: func(_ network.Network, c network.Conn) {
+				pid := c.RemotePeer()
+				for _, fn := range s.onConnected {
+					s.safeCallback(fn, pid, "OnPeerConnected")
+				}
+			},
+			DisconnectedF: func(_ network.Network, c network.Conn) {
+				pid := c.RemotePeer()
+				for _, fn := range s.onDisconnected {
+					s.safeCallback(fn, pid, "OnPeerDisconnected")
+				}
+			},
+		})
+	}
+
 	// Create node (DHT + PubSub).
 	n, err := node.New(ctx, &s.config.Node, h, s.logger)
 	if err != nil {
@@ -168,6 +239,17 @@ func (s *Server) Start(ctx context.Context) error {
 	)
 
 	return nil
+}
+
+// safeCallback invokes a connection event callback with panic recovery.
+func (s *Server) safeCallback(fn func(peer.ID), pid peer.ID, hook string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("panic in connection callback",
+				"hook", hook, "peer", pid, "panic", r)
+		}
+	}()
+	fn(pid)
 }
 
 // Stop gracefully shuts down the server.

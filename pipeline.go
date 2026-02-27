@@ -20,6 +20,7 @@ type Middleware func(sc *StreamContext, next func())
 type Pipeline struct {
 	middleware []Middleware
 	logger     *slog.Logger
+	registry   *Registry
 }
 
 // NewPipeline creates a pipeline with the given middleware chain.
@@ -35,10 +36,11 @@ func NewPipeline(logger *slog.Logger, mw ...Middleware) *Pipeline {
 // It creates a StreamContext, runs the middleware chain, and handles cleanup.
 func (p *Pipeline) HandleStream(s network.Stream) {
 	sc := &StreamContext{
-		Ctx:    context.Background(),
-		Stream: s,
-		PeerID: s.Conn().RemotePeer(),
-		Logger: p.logger,
+		Ctx:      context.Background(),
+		Stream:   s,
+		PeerID:   s.Conn().RemotePeer(),
+		Logger:   p.logger,
+		Registry: p.registry,
 	}
 
 	defer func() {
@@ -59,6 +61,14 @@ func (p *Pipeline) run(sc *StreamContext, idx int) {
 	p.middleware[idx](sc, func() {
 		p.run(sc, idx+1)
 	})
+}
+
+// WithRegistry sets the service registry for the pipeline.
+// The registry is injected into each StreamContext, making server-level
+// singletons accessible to handlers via ServiceFrom[T].
+func (p *Pipeline) WithRegistry(r *Registry) *Pipeline {
+	p.registry = r
+	return p
 }
 
 // Use appends middleware to the pipeline and returns the pipeline for chaining.
