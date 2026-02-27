@@ -28,6 +28,10 @@ type Config struct {
 	// Rate limiting defaults (can be overridden per-protocol)
 	RateLimitWindow      time.Duration `yaml:"rate_limit_window"`
 	MaxRequestsPerWindow int           `yaml:"max_requests_per_window"`
+
+	// ShutdownTimeout is the maximum time to wait for active streams to drain
+	// during graceful shutdown. Zero means no waiting (immediate close).
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }
 
 // DefaultConfig returns sensible defaults for a forge server.
@@ -38,6 +42,7 @@ func DefaultConfig() *Config {
 		DataDirectory:        "./data",
 		RateLimitWindow:      time.Minute,
 		MaxRequestsPerWindow: 100,
+		ShutdownTimeout:      5 * time.Second,
 	}
 }
 

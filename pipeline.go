@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"log/slog"
+	"sync"
 
 	"github.com/libp2p/go-libp2p/core/network"
 )
@@ -18,9 +19,10 @@ type Middleware func(sc *StreamContext, next func())
 // each wrapping the downstream call via next(). This enables bidirectional
 // processing (request + response) in a single middleware function.
 type Pipeline struct {
-	middleware []Middleware
-	logger     *slog.Logger
-	registry   *Registry
+	middleware    []Middleware
+	logger        *slog.Logger
+	registry      *Registry
+	activeStreams *sync.WaitGroup
 }
 
 // NewPipeline creates a pipeline with the given middleware chain.
@@ -35,6 +37,11 @@ func NewPipeline(logger *slog.Logger, mw ...Middleware) *Pipeline {
 // HandleStream is the entry point that satisfies libp2p's network.StreamHandler.
 // It creates a StreamContext, runs the middleware chain, and handles cleanup.
 func (p *Pipeline) HandleStream(s network.Stream) {
+	if p.activeStreams != nil {
+		p.activeStreams.Add(1)
+		defer p.activeStreams.Done()
+	}
+
 	sc := &StreamContext{
 		Ctx:      context.Background(),
 		Stream:   s,
@@ -74,6 +81,14 @@ func (p *Pipeline) WithRegistry(r *Registry) *Pipeline {
 // Use appends middleware to the pipeline and returns the pipeline for chaining.
 func (p *Pipeline) Use(mw ...Middleware) *Pipeline {
 	p.middleware = append(p.middleware, mw...)
+	return p
+}
+
+// WithActiveStreams sets a WaitGroup that tracks in-flight stream processing.
+// The pipeline calls Add(1) on stream entry and Done() on exit, enabling
+// graceful shutdown draining in Server.Stop().
+func (p *Pipeline) WithActiveStreams(wg *sync.WaitGroup) *Pipeline {
+	p.activeStreams = wg
 	return p
 }
 

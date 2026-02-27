@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -32,6 +34,8 @@ type Server struct {
 	registry       *Registry
 	onConnected    []func(peer.ID)
 	onDisconnected []func(peer.ID)
+	activeStreams   sync.WaitGroup
+	metrics        MetricsCollector
 }
 
 // Option configures a Server.
@@ -45,6 +49,7 @@ func NewServer(opts ...Option) *Server {
 		logger:   slog.Default(),
 		handlers: make(map[protocol.ID]network.StreamHandler),
 		registry: NewRegistry(),
+		metrics:  NoopMetrics{},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -92,6 +97,25 @@ func WithTransport(t libp2p.Option) Option {
 func WithPreset(preset Preset) Option {
 	return func(s *Server) { preset(s.config) }
 }
+
+// WithMetrics sets a MetricsCollector for observability. If not set, a no-op
+// collector is used and no metrics overhead is incurred.
+func WithMetrics(m MetricsCollector) Option {
+	return func(s *Server) { s.metrics = m }
+}
+
+// Metrics returns the server's MetricsCollector (NoopMetrics if none was configured).
+func (s *Server) Metrics() MetricsCollector { return s.metrics }
+
+// WithShutdownTimeout sets the maximum time to wait for active streams to drain
+// during graceful shutdown. Zero disables draining (immediate close).
+func WithShutdownTimeout(d time.Duration) Option {
+	return func(s *Server) { s.config.ShutdownTimeout = d }
+}
+
+// ActiveStreams returns the WaitGroup tracking in-flight streams. Pipelines should
+// call Add(1) on stream entry and Done() on stream exit to enable graceful draining.
+func (s *Server) ActiveStreams() *sync.WaitGroup { return &s.activeStreams }
 
 // OnPeerConnected registers a callback invoked when a new peer connection is established.
 // Multiple callbacks can be registered; they execute in registration order.
@@ -201,13 +225,15 @@ func (s *Server) Start(ctx context.Context) error {
 			ConnectedF: func(_ network.Network, c network.Conn) {
 				pid := c.RemotePeer()
 				for _, fn := range s.onConnected {
-					s.safeCallback(fn, pid, "OnPeerConnected")
+					fn := fn // capture loop variable
+					go s.safeCallback(fn, pid, "OnPeerConnected")
 				}
 			},
 			DisconnectedF: func(_ network.Network, c network.Conn) {
 				pid := c.RemotePeer()
 				for _, fn := range s.onDisconnected {
-					s.safeCallback(fn, pid, "OnPeerDisconnected")
+					fn := fn // capture loop variable
+					go s.safeCallback(fn, pid, "OnPeerDisconnected")
 				}
 			},
 		})
@@ -252,9 +278,27 @@ func (s *Server) safeCallback(fn func(peer.ID), pid peer.ID, hook string) {
 	fn(pid)
 }
 
-// Stop gracefully shuts down the server.
+// Stop gracefully shuts down the server. If ShutdownTimeout is configured,
+// it waits for active streams to drain before closing the node.
 func (s *Server) Stop() error {
 	s.logger.Info("stopping server")
+
+	// Remove stream handlers to stop accepting new streams.
+	for id := range s.handlers {
+		s.host.RemoveStreamHandler(id)
+	}
+
+	// Wait for active streams to drain.
+	if s.config.ShutdownTimeout > 0 {
+		done := make(chan struct{})
+		go func() { s.activeStreams.Wait(); close(done) }()
+		select {
+		case <-done:
+			s.logger.Info("all active streams drained")
+		case <-time.After(s.config.ShutdownTimeout):
+			s.logger.Warn("shutdown timeout reached, forcing close")
+		}
+	}
 
 	if err := s.lifecycle.StopAll(); err != nil {
 		s.logger.Warn("error stopping services", "error", err)

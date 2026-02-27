@@ -42,15 +42,17 @@ func DefaultConfig() *Config {
 }
 
 // Node wraps a libp2p host with DHT and GossipSub.
+// Topic and subscription maps use sync.Map for lock-free reads during Publish
+// and Subscribe, with per-topic join serialization to avoid blocking unrelated topics.
 type Node struct {
-	host   host.Host
-	dht    *dht.IpfsDHT
-	pubsub *pubsub.PubSub
-	topics map[string]*pubsub.Topic
-	subs   map[string]*pubsub.Subscription
-	logger *slog.Logger
-	mu     sync.RWMutex
-	cancel context.CancelFunc
+	host      host.Host
+	dht       *dht.IpfsDHT
+	pubsub    *pubsub.PubSub
+	topics    sync.Map // map[string]*pubsub.Topic
+	subs      sync.Map // map[string]*pubsub.Subscription
+	joinLocks sync.Map // map[string]*sync.Mutex — per-topic join serialization
+	logger    *slog.Logger
+	cancel    context.CancelFunc
 }
 
 // New creates and starts a new P2P node with DHT and optional GossipSub.
@@ -110,8 +112,6 @@ func New(ctx context.Context, cfg *Config, h host.Host, logger *slog.Logger) (*N
 	node := &Node{
 		host:   h,
 		dht:    kadDHT,
-		topics: make(map[string]*pubsub.Topic),
-		subs:   make(map[string]*pubsub.Subscription),
 		logger: logger,
 		cancel: cancel,
 	}
@@ -148,16 +148,26 @@ func (n *Node) DHT() *dht.IpfsDHT { return n.dht }
 // PubSub returns the underlying GossipSub instance.
 func (n *Node) PubSub() *pubsub.PubSub { return n.pubsub }
 
-// JoinTopic joins a GossipSub topic.
+// JoinTopic joins a GossipSub topic. Concurrent calls for the same topic name
+// are serialized via per-topic locking, but do not block operations on other topics.
 func (n *Node) JoinTopic(name string) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	if n.pubsub == nil {
 		return fmt.Errorf("pubsub not enabled")
 	}
 
-	if _, exists := n.topics[name]; exists {
+	// Fast path: already joined.
+	if _, exists := n.topics.Load(name); exists {
+		return nil
+	}
+
+	// Get or create per-topic lock.
+	lockVal, _ := n.joinLocks.LoadOrStore(name, &sync.Mutex{})
+	lock := lockVal.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Double-check after acquiring lock.
+	if _, exists := n.topics.Load(name); exists {
 		return nil
 	}
 
@@ -171,31 +181,30 @@ func (n *Node) JoinTopic(name string) error {
 		return fmt.Errorf("subscribe topic %s: %w", name, err)
 	}
 
-	n.topics[name] = topic
-	n.subs[name] = sub
+	n.topics.Store(name, topic)
+	n.subs.Store(name, sub)
 	n.logger.Info("joined topic", "topic", name)
 
 	return nil
 }
 
-// Publish publishes data to a topic.
+// Publish publishes data to a topic. This is a lock-free read on the topic map.
 func (n *Node) Publish(ctx context.Context, topic string, data []byte) error {
-	n.mu.RLock()
-	t, exists := n.topics[topic]
-	n.mu.RUnlock()
-
+	val, exists := n.topics.Load(topic)
 	if !exists {
 		return fmt.Errorf("topic %s not joined", topic)
 	}
 
-	return t.Publish(ctx, data)
+	return val.(*pubsub.Topic).Publish(ctx, data)
 }
 
-// Subscribe returns a subscription for a topic.
+// Subscribe returns a subscription for a topic. This is a lock-free read on the subscription map.
 func (n *Node) Subscribe(topic string) *pubsub.Subscription {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.subs[topic]
+	val, ok := n.subs.Load(topic)
+	if !ok {
+		return nil
+	}
+	return val.(*pubsub.Subscription)
 }
 
 // LogDHTStatus logs the current DHT routing table and connection state.
@@ -220,14 +229,14 @@ func (n *Node) LogDHTStatus() {
 func (n *Node) Close() error {
 	n.cancel()
 
-	n.mu.Lock()
-	for _, sub := range n.subs {
-		sub.Cancel()
-	}
-	for _, topic := range n.topics {
-		topic.Close()
-	}
-	n.mu.Unlock()
+	n.subs.Range(func(_, val any) bool {
+		val.(*pubsub.Subscription).Cancel()
+		return true
+	})
+	n.topics.Range(func(_, val any) bool {
+		val.(*pubsub.Topic).Close()
+		return true
+	})
 
 	if err := n.dht.Close(); err != nil {
 		n.logger.Warn("error closing dht", "error", err)
