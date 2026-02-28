@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multiaddr"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // DHTMode specifies how the DHT operates.
@@ -74,7 +75,8 @@ func New(ctx context.Context, cfg *Config, h host.Host, logger *slog.Logger) (*N
 
 	kadDHT, err := dht.New(ctx, h,
 		dht.Mode(mode),
-		dht.AddressFilter(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+		dht.RoutingTableRefreshQueryTimeout(30*time.Second),
+		dht.AddressFilter(func(addrs []ma.Multiaddr) []ma.Multiaddr {
 			return addrs
 		}),
 	)
@@ -92,7 +94,7 @@ func New(ctx context.Context, cfg *Config, h host.Host, logger *slog.Logger) (*N
 
 	// Connect to bootstrap peers.
 	for _, peerAddr := range cfg.BootstrapPeers {
-		maddr, err := multiaddr.NewMultiaddr(peerAddr)
+		maddr, err := ma.NewMultiaddr(peerAddr)
 		if err != nil {
 			logger.Warn("invalid bootstrap peer", "addr", peerAddr, "error", err)
 			continue
@@ -137,7 +139,7 @@ func New(ctx context.Context, cfg *Config, h host.Host, logger *slog.Logger) (*N
 func (n *Node) PeerID() peer.ID { return n.host.ID() }
 
 // Addrs returns this node's listen addresses.
-func (n *Node) Addrs() []multiaddr.Multiaddr { return n.host.Addrs() }
+func (n *Node) Addrs() []ma.Multiaddr { return n.host.Addrs() }
 
 // Host returns the underlying libp2p host.
 func (n *Node) Host() host.Host { return n.host }
@@ -244,3 +246,4 @@ func (n *Node) Close() error {
 
 	return n.host.Close()
 }
+
