@@ -122,18 +122,29 @@ func Create(cfg *Config, priv crypto.PrivKey, logger *slog.Logger, transports ..
 		opts = append(opts, libp2p.EnableAutoNATv2())
 	}
 
+	// Log relay configuration for diagnostics.
+	logger.Info("relay configuration",
+		"enable_relay", cfg.EnableRelay,
+		"enable_relay_service", cfg.EnableRelayService,
+		"enable_auto_relay", cfg.EnableAutoRelay,
+		"enable_hole_punching", cfg.EnableHolePunching,
+	)
+
 	// Relay configuration.
+	var relayResources *relayv2.Resources
 	if cfg.EnableRelay {
 		opts = append(opts, libp2p.EnableRelay())
 		if cfg.EnableRelayService {
 			rc := relayv2.DefaultResources()
-			applyRelayLimits(rc, &cfg.RelayLimits)
-			opts = append(opts, libp2p.EnableRelayService(relayv2.WithResources(rc)))
+			applyRelayLimits(&rc, &cfg.RelayLimits)
+			relayResources = &rc
+			// NOTE: We intentionally do NOT use libp2p.EnableRelayService() here.
+			// It creates a RelayManager that defers hop handler registration until
+			// a reachability event fires. With ForceReachabilityPublic, there is a
+			// race: the event can fire before the manager's goroutine subscribes,
+			// so the /libp2p/circuit/relay/0.2.0/hop handler never gets registered.
+			// Instead we create the relay service manually after host creation.
 			opts = append(opts, libp2p.ForceReachabilityPublic())
-			logger.Info("relay service enabled",
-				"max_reservations", rc.MaxReservations,
-				"max_circuits", rc.MaxCircuits,
-			)
 		}
 		if cfg.EnableHolePunching {
 			opts = append(opts, libp2p.EnableHolePunching())
@@ -153,11 +164,25 @@ func Create(cfg *Config, priv crypto.PrivKey, logger *slog.Logger, transports ..
 		return nil, fmt.Errorf("create host: %w", err)
 	}
 
+	// Create relay v2 service manually to register the hop handler immediately.
+	// This avoids the RelayManager race condition described above.
+	if relayResources != nil {
+		if _, err := relayv2.New(h, relayv2.WithResources(*relayResources)); err != nil {
+			h.Close()
+			return nil, fmt.Errorf("create relay service: %w", err)
+		}
+		logger.Info("relay service created",
+			"max_reservations", relayResources.MaxReservations,
+			"max_circuits", relayResources.MaxCircuits,
+		)
+	}
+
 	logger.Info("created libp2p host", "peer_id", h.ID().String())
+	logger.Info("registered protocols", "protocols", h.Mux().Protocols())
 	return h, nil
 }
 
-func applyRelayLimits(rc relayv2.Resources, rl *RelayLimits) {
+func applyRelayLimits(rc *relayv2.Resources, rl *RelayLimits) {
 	if rl.MaxReservations > 0 {
 		rc.MaxReservations = rl.MaxReservations
 	}
