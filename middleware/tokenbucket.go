@@ -25,6 +25,24 @@ type DualLimiter interface {
 	AllowN(peerID peer.ID, n int, isWrite bool) bool
 }
 
+// RetryLimiter is a Limiter that can say when a rejected request would be
+// admitted. It is a separate optional interface rather than part of Limiter so
+// that existing implementations keep satisfying Limiter; middleware asks for
+// it and falls back to a bare rejection when it is absent.
+type RetryLimiter interface {
+	Limiter
+	// AllowNWithRetry is AllowN, additionally reporting how long until n
+	// tokens would be available. The duration is meaningful only when the
+	// request was rejected, and is zero when no wait would ever help.
+	AllowNWithRetry(peerID peer.ID, n int) (bool, time.Duration)
+}
+
+// DualRetryLimiter is the DualLimiter equivalent of RetryLimiter.
+type DualRetryLimiter interface {
+	DualLimiter
+	AllowNWithRetry(peerID peer.ID, n int, isWrite bool) (bool, time.Duration)
+}
+
 // tokenState is one peer's bucket: how many tokens it holds, and when that
 // count was last brought up to date. Tokens are refilled lazily on access
 // rather than by a ticker, so an idle peer costs nothing until it returns.
@@ -107,14 +125,28 @@ func (b *TokenBucket) Allow(peerID peer.ID) bool {
 // bucket is short, nothing is consumed — a rejected request does not eat into
 // the peer's allowance.
 func (b *TokenBucket) AllowN(peerID peer.ID, n int) bool {
+	ok, _ := b.AllowNWithRetry(peerID, n)
+	return ok
+}
+
+// AllowNWithRetry is AllowN, additionally reporting how long the peer must
+// wait for n tokens when the request is rejected.
+//
+// The wait is computed under the same lock as the decision, so it describes
+// the bucket the request was actually measured against. Computing it in a
+// second call would race with every other stream on the same peer and could
+// report a wait for a bucket that has since refilled.
+func (b *TokenBucket) AllowNWithRetry(peerID peer.ID, n int) (bool, time.Duration) {
 	if b.unlimited || n <= 0 {
-		return true
+		return true, 0
 	}
 	// A request costing more than the whole bucket could never succeed, no
-	// matter how long the peer waits. Reject it rather than spin forever.
+	// matter how long the peer waits. Reject it rather than spin forever, and
+	// report no wait: there is no time at which this would be admitted, and
+	// naming one would send the caller back to fail again.
 	cost := float64(n)
 	if cost > b.burst {
-		return false
+		return false, 0
 	}
 
 	key := peerID.String()
@@ -137,10 +169,25 @@ func (b *TokenBucket) AllowN(peerID peer.ID, n int) bool {
 	}
 
 	if st.tokens < cost {
-		return false
+		return false, refillWait(cost-st.tokens, b.refillPerSec)
 	}
 	st.tokens -= cost
-	return true
+	return true, 0
+}
+
+// refillWait converts a token shortfall into the time the bucket needs to
+// cover it. It rounds up to the millisecond: rounding down would hand back a
+// wait that is still too short, and the caller would be rejected a second time
+// for having believed us.
+func refillWait(shortfall, refillPerSec float64) time.Duration {
+	if shortfall <= 0 || refillPerSec <= 0 {
+		return 0
+	}
+	d := time.Duration(shortfall / refillPerSec * float64(time.Second))
+	if d <= 0 {
+		return time.Millisecond
+	}
+	return d.Round(time.Millisecond) + time.Millisecond
 }
 
 // TrackedPeers reports how many peers currently hold bucket state. Intended
@@ -225,10 +272,18 @@ func (d *DualTokenBucket) Allow(peerID peer.ID, isWrite bool) bool {
 
 // AllowN consumes n tokens from the bucket selected by isWrite.
 func (d *DualTokenBucket) AllowN(peerID peer.ID, n int, isWrite bool) bool {
+	ok, _ := d.AllowNWithRetry(peerID, n, isWrite)
+	return ok
+}
+
+// AllowNWithRetry is AllowN, additionally reporting the wait on the bucket
+// that rejected the request. Read and write refill independently, so the wait
+// has to come from whichever one was charged.
+func (d *DualTokenBucket) AllowNWithRetry(peerID peer.ID, n int, isWrite bool) (bool, time.Duration) {
 	if isWrite {
-		return d.write.AllowN(peerID, n)
+		return d.write.AllowNWithRetry(peerID, n)
 	}
-	return d.read.AllowN(peerID, n)
+	return d.read.AllowNWithRetry(peerID, n)
 }
 
 // Close stops eviction goroutines for both buckets.
