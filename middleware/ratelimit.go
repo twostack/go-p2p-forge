@@ -47,6 +47,15 @@ func NewSingleBucket(window time.Duration, maxRequests int) *SingleBucket {
 
 // Allow returns true if the peer is within rate limits, and records the request.
 func (b *SingleBucket) Allow(peerID peer.ID) bool {
+	return b.AllowN(peerID, 1)
+}
+
+// AllowN returns true if the peer has room for n requests within the current
+// window, and records all n. Either all n are recorded or none are.
+func (b *SingleBucket) AllowN(peerID peer.ID, n int) bool {
+	if n <= 0 {
+		return true
+	}
 	key := peerID.String()
 	s := &b.shards[fnvHash(key)%b.shardCount]
 	s.mu.Lock()
@@ -63,12 +72,15 @@ func (b *SingleBucket) Allow(peerID peer.ID) bool {
 		}
 	}
 
-	if len(filtered) >= b.maxRequests {
+	if len(filtered)+n > b.maxRequests {
 		s.history[key] = filtered
 		return false
 	}
 
-	s.history[key] = append(filtered, now)
+	for i := 0; i < n; i++ {
+		filtered = append(filtered, now)
+	}
+	s.history[key] = filtered
 	return true
 }
 
@@ -141,10 +153,15 @@ func NewDualBucket(window time.Duration, maxRead, maxWrite int) *DualBucket {
 
 // Allow checks the appropriate bucket based on the isWrite flag.
 func (d *DualBucket) Allow(peerID peer.ID, isWrite bool) bool {
+	return d.AllowN(peerID, 1, isWrite)
+}
+
+// AllowN checks the appropriate bucket for n requests based on the isWrite flag.
+func (d *DualBucket) AllowN(peerID peer.ID, n int, isWrite bool) bool {
 	if isWrite {
-		return d.write.Allow(peerID)
+		return d.write.AllowN(peerID, n)
 	}
-	return d.read.Allow(peerID)
+	return d.read.AllowN(peerID, n)
 }
 
 // Close stops cleanup goroutines for both buckets.
