@@ -47,6 +47,34 @@ type StreamContext struct {
 	values map[any]any
 }
 
+// operationKey is the well-known key under which the routed operation name is
+// recorded. It is a private type so nothing outside this package can collide
+// with it.
+type operationKey struct{}
+
+// SetOperation records the operation this request was routed to.
+// OperationRouter calls it once a route has matched.
+func (sc *StreamContext) SetOperation(op string) {
+	sc.Set(operationKey{}, op)
+}
+
+// Operation returns the routed operation name, or the empty string when the
+// request never reached a route — because it carried no operation field, or
+// named one that does not exist.
+//
+// Middleware downstream of next() can read it to attribute timing, logging or
+// metrics to a specific operation. Because only a matched route is recorded,
+// the set of values is bounded by the routing table rather than by what a
+// caller sends, which is what makes it safe to use as a metric label.
+func (sc *StreamContext) Operation() string {
+	v, ok := sc.Get(operationKey{})
+	if !ok {
+		return ""
+	}
+	op, _ := v.(string)
+	return op
+}
+
 // Set stores a key-value pair for inter-middleware communication.
 func (sc *StreamContext) Set(key, val any) {
 	if sc.values == nil {

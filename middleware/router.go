@@ -57,6 +57,11 @@ func OperationRouter(fieldName string, routes map[string]forge.Middleware) forge
 			return
 		}
 
+		// Record the operation only after a route has matched, so the values
+		// downstream middleware sees are bounded by the routing table rather
+		// than by whatever a caller chose to send.
+		sc.SetOperation(opValue)
+
 		handler(sc, next)
 	}
 }
