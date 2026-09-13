@@ -3,11 +3,14 @@ package host
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	"github.com/libp2p/go-libp2p/x/rate"
 )
 
 // DefaultYamuxMaxIncomingStreams caps the streams one connection may have
@@ -23,7 +26,7 @@ const DefaultYamuxMaxIncomingStreams = 512
 const streamsPerConn = 8
 
 // connectionLimitOptions returns the resource manager and connection manager
-// that bound this host to cfg.MaxConnections.
+// that bound this host to cfg.MaxConnections and cfg.MaxConnectionsPerIP.
 //
 // The resource manager is the hard limit: a connection or stream beyond it is
 // refused at the transport. The connection manager works underneath it,
@@ -31,43 +34,22 @@ const streamsPerConn = 8
 // cap so there is always room for a new peer, rather than letting the host
 // run flat against the hard limit and refuse everyone.
 //
-// With MaxConnections zero, go-libp2p's defaults apply: limits auto-scaled
-// from system memory and a 160/192 connection manager.
+// With MaxConnections zero, go-libp2p's memory-scaled limits and its default
+// 160/192 connection manager apply. The resource manager is still built
+// here rather than left to go-libp2p, so that the per-address policy is the
+// one in cfg and never go-libp2p's own.
 func connectionLimitOptions(cfg *Config, logger *slog.Logger) ([]libp2p.Option, error) {
+	mgr, err := newResourceManager(cfg)
+	if err != nil {
+		return nil, err
+	}
+	opts := []libp2p.Option{libp2p.ResourceManager(mgr)}
+
 	maxConns := cfg.MaxConnections
 	if maxConns <= 0 {
-		logger.Info("connection limits: libp2p defaults (max_connections not set)")
-		return nil, nil
-	}
-
-	scaled := rcmgr.DefaultLimits.AutoScale()
-	system := rcmgr.ResourceLimits{
-		Conns:           rcmgr.LimitVal(maxConns),
-		ConnsInbound:    rcmgr.LimitVal(maxConns),
-		ConnsOutbound:   rcmgr.LimitVal(maxConns),
-		Streams:         rcmgr.LimitVal(maxConns * streamsPerConn * 2),
-		StreamsInbound:  rcmgr.LimitVal(maxConns * streamsPerConn),
-		StreamsOutbound: rcmgr.LimitVal(maxConns * streamsPerConn),
-		FD:              rcmgr.LimitVal(maxConns),
-	}
-	// Transient covers connections still in the handshake, before they are
-	// attributed to a peer. A quarter of the cap lets a reconnect storm
-	// after a restart get through instead of being refused at the door.
-	transientConns := max(maxConns/4, 64)
-	transient := rcmgr.ResourceLimits{
-		Conns:           rcmgr.LimitVal(transientConns),
-		ConnsInbound:    rcmgr.LimitVal(transientConns),
-		ConnsOutbound:   rcmgr.LimitVal(transientConns),
-		Streams:         rcmgr.LimitVal(transientConns * streamsPerConn * 2),
-		StreamsInbound:  rcmgr.LimitVal(transientConns * streamsPerConn),
-		StreamsOutbound: rcmgr.LimitVal(transientConns * streamsPerConn),
-		FD:              rcmgr.LimitVal(transientConns),
-	}
-	limits := rcmgr.PartialLimitConfig{System: system, Transient: transient}.Build(scaled)
-
-	mgr, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(limits))
-	if err != nil {
-		return nil, fmt.Errorf("create resource manager: %w", err)
+		logger.Info("connection limits: libp2p defaults (max_connections not set)",
+			"max_connections_per_ip", cfg.MaxConnectionsPerIP)
+		return opts, nil
 	}
 
 	high := maxConns - maxConns/10
@@ -90,17 +72,85 @@ func connectionLimitOptions(cfg *Config, logger *slog.Logger) ([]libp2p.Option, 
 
 	logger.Info("connection limits",
 		"max_connections", maxConns,
-		"transient_connections", transientConns,
+		"max_connections_per_ip", cfg.MaxConnectionsPerIP,
+		"transient_connections", max(maxConns/4, 64),
 		"system_streams_inbound", maxConns*streamsPerConn,
 		"connmgr_high_water", high,
 		"connmgr_low_water", low,
 		"connmgr_grace", grace,
 	)
 
-	return []libp2p.Option{
-		libp2p.ResourceManager(mgr),
-		libp2p.ConnectionManager(cm),
-	}, nil
+	return append(opts, libp2p.ConnectionManager(cm)), nil
+}
+
+// newResourceManager builds the resource manager for cfg: system and
+// transient limits from MaxConnections when it is set, go-libp2p's scaled
+// defaults otherwise, and in both cases the per-address policy from
+// MaxConnectionsPerIP with no per-address rate limit.
+func newResourceManager(cfg *Config) (network.ResourceManager, error) {
+	scaled := rcmgr.DefaultLimits
+	libp2p.SetDefaultServiceLimits(&scaled)
+	limits := scaled.AutoScale()
+
+	if maxConns := cfg.MaxConnections; maxConns > 0 {
+		system := rcmgr.ResourceLimits{
+			Conns:           rcmgr.LimitVal(maxConns),
+			ConnsInbound:    rcmgr.LimitVal(maxConns),
+			ConnsOutbound:   rcmgr.LimitVal(maxConns),
+			Streams:         rcmgr.LimitVal(maxConns * streamsPerConn * 2),
+			StreamsInbound:  rcmgr.LimitVal(maxConns * streamsPerConn),
+			StreamsOutbound: rcmgr.LimitVal(maxConns * streamsPerConn),
+			FD:              rcmgr.LimitVal(maxConns),
+		}
+		// Transient covers connections still in the handshake, before they
+		// are attributed to a peer. A quarter of the cap lets a reconnect
+		// storm after a restart get through instead of being refused at the
+		// door.
+		transientConns := max(maxConns/4, 64)
+		transient := rcmgr.ResourceLimits{
+			Conns:           rcmgr.LimitVal(transientConns),
+			ConnsInbound:    rcmgr.LimitVal(transientConns),
+			ConnsOutbound:   rcmgr.LimitVal(transientConns),
+			Streams:         rcmgr.LimitVal(transientConns * streamsPerConn * 2),
+			StreamsInbound:  rcmgr.LimitVal(transientConns * streamsPerConn),
+			StreamsOutbound: rcmgr.LimitVal(transientConns * streamsPerConn),
+			FD:              rcmgr.LimitVal(transientConns),
+		}
+		limits = rcmgr.PartialLimitConfig{System: system, Transient: transient}.Build(limits)
+	}
+
+	mgr, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(limits), perAddressOptions(cfg.MaxConnectionsPerIP)...)
+	if err != nil {
+		return nil, fmt.Errorf("create resource manager: %w", err)
+	}
+	return mgr, nil
+}
+
+// perAddressOptions is the per-source-address policy: a concurrency cap of
+// perIP connections (none when perIP is zero) and no rate limit on new
+// connections. Loopback keeps go-libp2p's exemption from the cap.
+func perAddressOptions(perIP int) []rcmgr.Option {
+	capacity := math.MaxInt
+	if perIP > 0 {
+		capacity = perIP
+	}
+	return []rcmgr.Option{
+		rcmgr.WithLimitPerSubnet(
+			[]rcmgr.ConnLimitPerSubnet{{PrefixLength: 32, ConnCount: capacity}},
+			[]rcmgr.ConnLimitPerSubnet{
+				{PrefixLength: 56, ConnCount: capacity},
+				{PrefixLength: 48, ConnCount: saturatingMul(capacity, 8)},
+			},
+		),
+		rcmgr.WithConnRateLimiters(&rate.Limiter{}),
+	}
+}
+
+func saturatingMul(a, b int) int {
+	if a > math.MaxInt/b {
+		return math.MaxInt
+	}
+	return a * b
 }
 
 // DefaultConnManagerGracePeriod is how long a new connection is protected

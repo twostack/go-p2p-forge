@@ -38,6 +38,15 @@ type Config struct {
 	// trimming idle peers before the cap is reached. Zero leaves go-libp2p's
 	// memory-scaled defaults in place.
 	MaxConnections int `yaml:"max_connections"`
+	// MaxConnectionsPerIP caps the connections held open with any one
+	// source address: an IPv4 address, or an IPv6 /56, with eight times as
+	// many per /48. Zero means no per-address cap, and that is the
+	// deliberate default: many clients legitimately share one address
+	// behind a carrier NAT or an office gateway, and go-libp2p's own default
+	// of eight per address turned the ninth of them away. Loopback is never
+	// capped. The per-address rate limit go-libp2p also applies by default
+	// is always off: this host bounds concurrency, not rate.
+	MaxConnectionsPerIP int `yaml:"max_connections_per_ip"`
 	// ConnManagerGracePeriod is how long a new connection is safe from
 	// trimming. Zero means DefaultConnManagerGracePeriod.
 	ConnManagerGracePeriod time.Duration `yaml:"connmgr_grace_period"`
