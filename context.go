@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -42,6 +43,11 @@ type StreamContext struct {
 
 	// Registry provides access to server-level singletons registered via Server.Provide().
 	Registry *Registry
+
+	// IdleTimeout is how long a frame read or write may wait for the peer to
+	// make progress before the stream is abandoned. The pipeline sets it;
+	// WriteFrame and FrameDecodeMiddleware honour it. Zero means no deadline.
+	IdleTimeout time.Duration
 
 	// values is a bag for inter-middleware communication.
 	values map[any]any
@@ -90,4 +96,12 @@ func (sc *StreamContext) Get(key any) (any, bool) {
 	}
 	v, ok := sc.values[key]
 	return v, ok
+}
+
+// WriteFrame writes data to the stream as one length-prefixed frame, bounded
+// by the context's IdleTimeout so a peer that stops reading cannot hold the
+// handler for the whole response. Response writers should use it instead of
+// codec.WriteFrame on sc.Stream directly.
+func (sc *StreamContext) WriteFrame(data []byte) error {
+	return codec.WriteFrameWithTimeout(sc.Stream, data, sc.IdleTimeout)
 }

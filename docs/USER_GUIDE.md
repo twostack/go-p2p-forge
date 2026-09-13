@@ -315,6 +315,19 @@ p := forge.NewPipeline(logger).
     Use(handler)
 ```
 
+### Stream Timeouts
+
+Every inbound stream is bounded twice:
+
+| Setting | Default | What it bounds |
+|---|---|---|
+| `WithIdleTimeout(d)` | 30s | How long a frame read or write may wait for the peer to make progress. Refreshed after every 64 KB, so it catches a stalled peer without capping how long a large transfer may take. |
+| `WithRequestTimeout(d)` | 5m | The whole life of the stream. It is the deadline on `sc.Ctx`, and when it passes the stream is reset so a blocked read or write returns. |
+
+`sc.Ctx` is always cancelled once the stream has been handled, so goroutines and database calls derived from it cannot outlive the request. Zero disables either timeout.
+
+The frame decoder never allocates a frame's declared size up front: frames larger than the biggest pool tier grow as bytes arrive, so a peer that declares ten megabytes and sends nothing costs nothing. Response writers should send through `sc.WriteFrame(data)` rather than `codec.WriteFrame(sc.Stream, data)` so the idle timeout applies to the response too.
+
 ---
 
 ## 4. Codec & Serialization
@@ -559,6 +572,9 @@ host:
   enable_autonat: true
   yamux_keepalive: 60s
   yamux_write_timeout: 30s
+  yamux_max_incoming_streams: 512
+  max_connections: 10000     # 0 = go-libp2p's memory-scaled defaults
+  connmgr_grace_period: 30s
 
 node:
   dht_mode: 0        # 0=Server, 1=Client, 2=Auto
@@ -582,6 +598,9 @@ The `host.Config` controls the libp2p layer:
 | `ExternalAddresses` | [] | Addresses to advertise for NAT traversal |
 | `YamuxKeepAlive` | 60s | Yamux keep-alive interval |
 | `YamuxWriteTimeout` | 30s | Yamux write timeout |
+| `YamuxMaxIncomingStreams` | 512 | Concurrent inbound streams one connection may hold |
+| `MaxConnections` | 0 | Hard cap on open connections, enforced by the libp2p resource manager; a connection manager trims idle peers from 90% down to 80% of it. 0 keeps go-libp2p's defaults (limits auto-scaled from system memory, 160/192 connection manager) |
+| `ConnManagerGracePeriod` | 30s | How long a new connection is safe from trimming |
 | `EnableRelay` | true | Enable circuit relay v2 |
 | `EnableRelayService` | false | Act as a relay for other peers |
 | `EnableAutoRelay` | false | Use bootstrap peers as relays |

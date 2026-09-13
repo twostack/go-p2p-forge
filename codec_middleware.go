@@ -10,10 +10,12 @@ import (
 // stores the raw bytes in sc.RawBytes. Uses buffer pooling to reduce GC pressure.
 func FrameDecodeMiddleware(pool *codec.BufferPool) Middleware {
 	return func(sc *StreamContext, next func()) {
-		buf, err := codec.ReadFramePooled(sc.Stream, pool)
+		buf, err := codec.ReadFramePooledWithTimeout(sc.Stream, pool, sc.IdleTimeout)
 		if err != nil {
 			sc.Err = err
-			sc.Logger.Error("failed to read frame", "error", err, "peer", sc.PeerID)
+			// A peer's malformed or stalled frame is its problem, not an
+			// error in this server, so it does not log at Error.
+			sc.Logger.Warn("failed to read frame", "error", err, "peer", sc.PeerID)
 			return
 		}
 		sc.RawBytes = buf.Bytes()

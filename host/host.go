@@ -8,7 +8,6 @@ import (
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
@@ -28,6 +27,19 @@ type Config struct {
 	// Yamux tuning
 	YamuxKeepAlive    time.Duration `yaml:"yamux_keepalive"`
 	YamuxWriteTimeout time.Duration `yaml:"yamux_write_timeout"`
+	// YamuxMaxIncomingStreams caps concurrent inbound streams per connection.
+	// Zero means DefaultYamuxMaxIncomingStreams.
+	YamuxMaxIncomingStreams uint32 `yaml:"yamux_max_incoming_streams"`
+
+	// Resource limits.
+	// MaxConnections is the hard cap on connections this host holds open,
+	// enforced by the libp2p resource manager, with a connection manager
+	// trimming idle peers before the cap is reached. Zero leaves go-libp2p's
+	// memory-scaled defaults in place.
+	MaxConnections int `yaml:"max_connections"`
+	// ConnManagerGracePeriod is how long a new connection is safe from
+	// trimming. Zero means DefaultConnManagerGracePeriod.
+	ConnManagerGracePeriod time.Duration `yaml:"connmgr_grace_period"`
 
 	// Relay
 	EnableRelay        bool        `yaml:"enable_relay"`
@@ -73,7 +85,11 @@ func Create(cfg *Config, priv crypto.PrivKey, logger *slog.Logger, transports ..
 		}
 	}
 
-	yamuxTransport := yamux.DefaultTransport
+	// Copy the default yamux config rather than tuning it in place:
+	// Config() hands back a pointer into the package-level DefaultTransport,
+	// and every other host in the process shares that.
+	yamuxCfgCopy := *yamux.DefaultTransport.Config()
+	yamuxTransport := (*yamux.Transport)(&yamuxCfgCopy)
 	yamuxCfg := yamuxTransport.Config()
 	if cfg.YamuxKeepAlive > 0 {
 		yamuxCfg.KeepAliveInterval = cfg.YamuxKeepAlive
@@ -81,13 +97,22 @@ func Create(cfg *Config, priv crypto.PrivKey, logger *slog.Logger, transports ..
 	if cfg.YamuxWriteTimeout > 0 {
 		yamuxCfg.ConnectionWriteTimeout = cfg.YamuxWriteTimeout
 	}
+	yamuxCfg.MaxIncomingStreams = cfg.YamuxMaxIncomingStreams
+	if yamuxCfg.MaxIncomingStreams == 0 {
+		yamuxCfg.MaxIncomingStreams = DefaultYamuxMaxIncomingStreams
+	}
 
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Muxer("/yamux/1.0.0", yamuxTransport),
-		libp2p.ResourceManager(&network.NullResourceManager{}),
 	}
+
+	limitOpts, err := connectionLimitOptions(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts, limitOpts...)
 
 	// Add transport options. If custom transports are provided, disable defaults.
 	if len(transports) > 0 {

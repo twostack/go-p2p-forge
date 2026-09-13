@@ -3,8 +3,6 @@ package forge
 import (
 	"fmt"
 	"io"
-
-	"github.com/twostack/go-p2p-forge/codec"
 )
 
 // Codec defines a symmetric encoding/decoding interface for stream payloads.
@@ -69,7 +67,7 @@ func ResponseWriterMiddleware(c Codec) Middleware {
 						"codec", c.ContentType(), "error", err)
 					return
 				}
-				if err := codec.WriteFrame(sc.Stream, data); err != nil {
+				if err := sc.WriteFrame(data); err != nil {
 					sc.Err = fmt.Errorf("write frame: %w", err)
 					sc.Logger.Error("failed to write frame",
 						"codec", c.ContentType(), "error", err)
@@ -86,7 +84,7 @@ func ResponseWriterMiddleware(c Codec) Middleware {
 			return
 		}
 
-		if err := codec.WriteFrame(sc.Stream, data); err != nil {
+		if err := sc.WriteFrame(data); err != nil {
 			sc.Logger.Error("failed to write response",
 				"codec", c.ContentType(), "error", err)
 		}
