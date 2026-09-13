@@ -76,6 +76,7 @@ func New(ctx context.Context, cfg *Config, h host.Host, logger *slog.Logger) (*N
 	kadDHT, err := dht.New(h,
 		dht.Mode(mode),
 		dht.RoutingTableRefreshQueryTimeout(30*time.Second),
+		dht.RoutingTableFilter(dialableFilter(h, logger)),
 		dht.AddressFilter(func(addrs []ma.Multiaddr) []ma.Multiaddr {
 			return addrs
 		}),
