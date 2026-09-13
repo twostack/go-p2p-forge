@@ -190,6 +190,30 @@ func (n *Node) JoinTopic(name string) error {
 	return nil
 }
 
+// LeaveTopic cancels the subscription to a topic and closes it, undoing
+// JoinTopic. Leaving a topic that was never joined is not an error. It
+// takes the same per-topic lock as JoinTopic, so a join and a leave of the
+// same topic cannot interleave.
+func (n *Node) LeaveTopic(name string) error {
+	lockVal, _ := n.joinLocks.LoadOrStore(name, &sync.Mutex{})
+	lock := lockVal.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if sub, ok := n.subs.LoadAndDelete(name); ok {
+		sub.(*pubsub.Subscription).Cancel()
+	}
+	topic, ok := n.topics.LoadAndDelete(name)
+	if !ok {
+		return nil
+	}
+	if err := topic.(*pubsub.Topic).Close(); err != nil {
+		return fmt.Errorf("close topic %s: %w", name, err)
+	}
+	n.logger.Info("left topic", "topic", name)
+	return nil
+}
+
 // Publish publishes data to a topic. This is a lock-free read on the topic map.
 func (n *Node) Publish(ctx context.Context, topic string, data []byte) error {
 	val, exists := n.topics.Load(topic)
@@ -246,4 +270,3 @@ func (n *Node) Close() error {
 
 	return n.host.Close()
 }
-
