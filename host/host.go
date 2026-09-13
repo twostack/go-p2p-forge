@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/connmgr"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -40,6 +41,11 @@ type Config struct {
 	// ConnManagerGracePeriod is how long a new connection is safe from
 	// trimming. Zero means DefaultConnManagerGracePeriod.
 	ConnManagerGracePeriod time.Duration `yaml:"connmgr_grace_period"`
+	// ConnectionGater, when set, is consulted for every connection and can
+	// refuse peers before any stream is opened. It is code, not
+	// configuration, so it has no YAML form; the application builds it from
+	// its own allow-list settings.
+	ConnectionGater connmgr.ConnectionGater `yaml:"-"`
 
 	// Relay
 	EnableRelay        bool        `yaml:"enable_relay"`
@@ -113,6 +119,10 @@ func Create(cfg *Config, priv crypto.PrivKey, logger *slog.Logger, transports ..
 		return nil, err
 	}
 	opts = append(opts, limitOpts...)
+
+	if cfg.ConnectionGater != nil {
+		opts = append(opts, libp2p.ConnectionGater(cfg.ConnectionGater))
+	}
 
 	// Add transport options. If custom transports are provided, disable defaults.
 	if len(transports) > 0 {

@@ -601,6 +601,7 @@ The `host.Config` controls the libp2p layer:
 | `YamuxMaxIncomingStreams` | 512 | Concurrent inbound streams one connection may hold |
 | `MaxConnections` | 0 | Hard cap on open connections, enforced by the libp2p resource manager; a connection manager trims idle peers from 90% down to 80% of it. 0 keeps go-libp2p's defaults (limits auto-scaled from system memory, 160/192 connection manager) |
 | `ConnManagerGracePeriod` | 30s | How long a new connection is safe from trimming |
+| `ConnectionGater` | nil | A `connmgr.ConnectionGater` consulted for every connection; set it in code to refuse peers by identity or address before any stream opens |
 | `EnableRelay` | true | Enable circuit relay v2 |
 | `EnableRelayService` | false | Act as a relay for other peers |
 | `EnableAutoRelay` | false | Use bootstrap peers as relays |
